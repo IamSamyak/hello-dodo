@@ -844,8 +844,27 @@ async def health():
 
 
 @app.get("/tools/next")
-async def next_tool_command():
-    command = await command_bus.next_command()
+async def next_tool_command(
+    tool_name: str | None = Query(default=None),
+):
+    if tool_name is not None:
+        tool_name = tool_name.strip()
+
+        if not tool_name:
+            raise HTTPException(
+                status_code=400,
+                detail="tool_name cannot be empty.",
+            )
+
+        if tool_name != "play_music":
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported tool queue filter.",
+            )
+
+        command = await command_bus.next_command_for_tool(tool_name)
+    else:
+        command = await command_bus.next_command()
 
     if command is not None:
         logger.info(

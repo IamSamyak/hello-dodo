@@ -289,6 +289,70 @@ class CommandBus:
 
             finally:
                 self._queue.task_done()
+                
+                
+    async def next_command_for_tool(
+        self,
+        tool_name: str,
+    ) -> dict[str, Any] | None:
+        """Deliver the next queued command matching a specific tool.
+
+        Commands for other tools remain in the queue.
+        """
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise ValueError("tool_name cannot be empty.")
+
+        async with self._lock:
+            queued_commands: list[ToolCommand] = []
+            selected_command: ToolCommand | None = None
+            now = time.time()
+
+            while True:
+                try:
+                    command = self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                self._queue.task_done()
+
+                pending = self._pending.get(command.command_id)
+
+                if (
+                    pending is None
+                    or pending.future.done()
+                    or now >= pending.expires_at
+                ):
+                    if pending is not None:
+                        self._pending.pop(command.command_id, None)
+
+                        if not pending.future.done():
+                            pending.future.cancel()
+
+                    continue
+
+                if (
+                    selected_command is None
+                    and command.tool_name == tool_name
+                ):
+                    selected_command = command
+                else:
+                    queued_commands.append(command)
+
+            for command in queued_commands:
+                self._queue.put_nowait(command)
+
+            if selected_command is None:
+                return None
+
+            logger.info(
+                "TRACE=%s COMMAND_DELIVERED id=%s tool=%s action=%s",
+                self._trace_id(selected_command.payload),
+                selected_command.command_id,
+                selected_command.tool_name,
+                selected_command.action,
+            )
+
+            return selected_command.to_dict()
 
     async def complete(
         self,

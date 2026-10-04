@@ -1,56 +1,111 @@
 
-"""Generic dispatcher for Hello Dodo tools."""
+"""Validated tool dispatcher for Hello Dodo."""
 
 from __future__ import annotations
 
 import inspect
 import logging
-import time
 import uuid
 from typing import Any
 
+from tools.contracts import ContractValidationError
 from tools.intent_router import IntentRouter, intent_router
 from tools.models import ToolContext, ToolResult
 from tools.registry import ToolRegistry, tool_registry
+
 
 logger = logging.getLogger(__name__)
 
 
 class ToolDispatcher:
-    """Resolve and execute registered Hello Dodo tools."""
+    """Validate and dispatch calls to registered tools."""
 
     def __init__(
         self,
-        *,
-        registry: ToolRegistry = tool_registry,
-        router: IntentRouter = intent_router,
+        registry: ToolRegistry | None = None,
+        router: IntentRouter | None = None,
     ) -> None:
-        self._registry = registry
-        self._router = router
+        self.registry = registry or tool_registry
+        self.router = router or intent_router
 
     @staticmethod
     def _normalize_result(result: Any) -> ToolResult:
+        """Convert supported handler results into ToolResult."""
+
         if isinstance(result, ToolResult):
             return result
 
-        if isinstance(result, dict):
+        if isinstance(result, str):
             return ToolResult(
-                success=bool(result.get("success", True)),
-                message=str(
-                    result.get("message", "Command completed.")
-                ),
-                data=result.get("data", {}),
-                error_code=result.get("error_code"),
+                success=True,
+                message=result,
             )
 
-        if isinstance(result, str):
-            return ToolResult(success=True, message=result)
+        if isinstance(result, dict):
+            success = result.get("success")
+
+            if not isinstance(success, bool):
+                return ToolResult(
+                    success=False,
+                    message="Tool returned a result without a valid success flag.",
+                    error_code="INVALID_TOOL_RESULT",
+                )
+
+            message = result.get("message", "")
+
+            if not isinstance(message, str):
+                message = str(message)
+
+            data = result.get("data", {})
+            if not isinstance(data, dict):
+                data = {"result": data}
+
+            error_code = result.get("error_code")
+            if error_code is not None and not isinstance(error_code, str):
+                error_code = str(error_code)
+
+            return ToolResult(
+                success=success,
+                message=message,
+                data=data,
+                error_code=error_code,
+            )
 
         return ToolResult(
             success=False,
-            message="The tool returned an invalid response.",
+            message="Tool returned an unsupported result type.",
             error_code="INVALID_TOOL_RESULT",
         )
+
+    @staticmethod
+    def _validate_arguments(
+        arguments: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        """Validate the common tool-call envelope."""
+
+        unexpected = set(arguments) - {"action", "payload"}
+
+        if unexpected:
+            raise ContractValidationError(
+                "Unexpected tool argument(s): "
+                + ", ".join(sorted(unexpected))
+            )
+
+        action = arguments.get("action")
+
+        if not isinstance(action, str) or not action.strip():
+            raise ContractValidationError(
+                "Tool action must be a non-empty string."
+            )
+
+        payload = arguments.get("payload", {})
+
+        if not isinstance(payload, dict):
+            raise ContractValidationError(
+                "Tool payload must be a JSON object."
+            )
+
+        return action.strip(), payload
 
     async def dispatch_tool_call(
         self,
@@ -60,116 +115,150 @@ class ToolDispatcher:
         source: str = "voice",
         trace_id: str = "-",
     ) -> ToolResult:
-        """Execute a GPT-selected registered tool after validation."""
-        started = time.monotonic()
-        request_id = str(uuid.uuid4())
+        """Validate a tool call and execute its registered handler."""
 
-        logger.info(
-            "TRACE=%s GPT_TOOL_DISPATCH_START tool=%s request_id=%s",
-            trace_id,
-            tool_name,
-            request_id,
-        )
+        request_id = str(uuid.uuid4())
 
         if not isinstance(tool_name, str) or not tool_name.strip():
             return ToolResult(
                 success=False,
-                message="GPT selected an invalid tool name.",
+                message="Tool name must be a non-empty string.",
                 error_code="INVALID_TOOL_NAME",
             )
 
         if not isinstance(arguments, dict):
             return ToolResult(
                 success=False,
-                message="GPT returned invalid tool arguments.",
+                message="Tool arguments must be a JSON object.",
                 error_code="INVALID_TOOL_ARGUMENTS",
             )
 
-        action = arguments.get("action")
-        if not isinstance(action, str) or not action.strip():
-            return ToolResult(
-                success=False,
-                message="The selected tool requires a valid action.",
-                error_code="MISSING_TOOL_ACTION",
-            )
+        definition = self.registry.get(tool_name.strip())
 
-        tool = self._registry.get(tool_name)
-
-        if tool is None:
+        if definition is None:
             logger.warning(
-                "TRACE=%s GPT_TOOL_NOT_REGISTERED tool=%s",
+                "TRACE=%s TOOL_REJECTED unknown_tool=%s request_id=%s",
                 trace_id,
                 tool_name,
+                request_id,
             )
             return ToolResult(
                 success=False,
-                message=f"The requested tool '{tool_name}' is unavailable.",
-                error_code="TOOL_NOT_REGISTERED",
+                message=f"Tool '{tool_name}' is not registered.",
+                error_code="UNKNOWN_TOOL",
             )
 
-        if not tool.enabled:
+        if not definition.enabled:
             return ToolResult(
                 success=False,
-                message=f"The requested tool '{tool_name}' is disabled.",
+                message=f"Tool '{definition.name}' is disabled.",
                 error_code="TOOL_DISABLED",
             )
 
-        supplied_payload = arguments.get("payload", {})
-        if not isinstance(supplied_payload, dict):
-            return ToolResult(
-                success=False,
-                message="The tool payload must be an object.",
-                error_code="INVALID_TOOL_PAYLOAD",
-            )
-
-        payload = dict(supplied_payload)
-        payload.update(
-            {
-                "request_id": request_id,
-                "source": source,
-                "trace_id": trace_id,
-                "matched_rule": "gpt_tool_decision",
-            }
-        )
-
         try:
-            result: Any = tool.handler(
-                action=action,
-                payload=payload,
+            action, payload = self._validate_arguments(arguments)
+
+            spec = getattr(definition, "spec", None)
+            plugin = getattr(definition, "plugin", None)
+
+            if spec is not None:
+                allowed_actions = {
+                    item.name: item
+                    for item in spec.actions
+                }
+
+                if action not in allowed_actions:
+                    raise ContractValidationError(
+                        f"Action '{action}' is not declared by "
+                        f"tool '{definition.name}'."
+                    )
+
+            if plugin is not None:
+                plugin.validate_action(action, payload)
+
+            context = ToolContext(
+                request_id=request_id,
+                source=source,
+                trace_id=trace_id,
             )
+
+            logger.info(
+                "TRACE=%s TOOL_EXECUTION_START "
+                "tool=%s action=%s request_id=%s source=%s",
+                trace_id,
+                definition.name,
+                action,
+                request_id,
+                source,
+            )
+
+            if plugin is not None:
+                result = plugin.execute(
+                    action=action,
+                    payload=dict(payload),
+                    context=context,
+                )
+            else:
+                # Compatibility path for tools that still use legacy
+                # handlers while the plugin migration is in progress.
+                execution_payload = dict(payload)
+                execution_payload.update(
+                    {
+                        "request_id": request_id,
+                        "source": source,
+                        "trace_id": trace_id,
+                        "matched_rule": "gpt_tool_decision",
+                    }
+                )
+
+                result = definition.handler(
+                    action=action,
+                    payload=execution_payload,
+                )
 
             if inspect.isawaitable(result):
                 result = await result
 
-            tool_result = self._normalize_result(result)
+            normalized = self._normalize_result(result)
 
             logger.info(
-                "TRACE=%s GPT_TOOL_DISPATCH_END tool=%s action=%s "
-                "request_id=%s success=%s error_code=%s elapsed=%.2fs",
+                "TRACE=%s TOOL_EXECUTION_END "
+                "tool=%s action=%s request_id=%s success=%s",
                 trace_id,
-                tool_name,
+                definition.name,
                 action,
                 request_id,
-                tool_result.success,
-                tool_result.error_code,
-                time.monotonic() - started,
+                normalized.success,
             )
 
-            return tool_result
+            return normalized
 
-        except Exception:
-            logger.exception(
-                "TRACE=%s GPT_TOOL_DISPATCH_FAILED tool=%s action=%s "
-                "request_id=%s elapsed=%.2fs",
+        except ContractValidationError as exc:
+            logger.warning(
+                "TRACE=%s TOOL_CONTRACT_REJECTED "
+                "tool=%s request_id=%s reason=%s",
                 trace_id,
-                tool_name,
-                action,
+                definition.name,
                 request_id,
-                time.monotonic() - started,
+                exc,
             )
             return ToolResult(
                 success=False,
-                message="The selected tool failed during execution.",
+                message=str(exc),
+                error_code="CONTRACT_VALIDATION_FAILED",
+            )
+
+        except Exception:
+            logger.exception(
+                "TRACE=%s TOOL_EXECUTION_FAILED "
+                "tool=%s request_id=%s",
+                trace_id,
+                definition.name,
+                request_id,
+            )
+            return ToolResult(
+                success=False,
+                message="The requested tool failed during execution.",
                 error_code="TOOL_EXECUTION_FAILED",
             )
 
@@ -179,49 +268,28 @@ class ToolDispatcher:
         *,
         source: str = "voice",
         trace_id: str = "-",
-    ) -> ToolResult | None:
-        """Keep the existing phrase-based routing available."""
-        started = time.monotonic()
+    ) -> ToolResult:
+        """Route a phrase-based request through the existing intent router."""
 
-        logger.info(
-            "TRACE=%s INTENT_RESOLVE_START source=%s message=%r",
-            trace_id,
-            source,
-            message[:200],
-        )
-
-        try:
-            match = self._router.resolve(message)
-        except Exception:
-            logger.exception(
-                "TRACE=%s INTENT_RESOLVE_FAILED",
-                trace_id,
-            )
+        if not isinstance(message, str) or not message.strip():
             return ToolResult(
                 success=False,
-                message="I couldn't resolve the local command.",
-                error_code="INTENT_RESOLVE_FAILED",
+                message="Message cannot be empty.",
+                error_code="EMPTY_MESSAGE",
             )
+
+        match = self.router.match(message)
 
         if match is None:
-            logger.info(
-                "TRACE=%s INTENT_NO_MATCH source=%s",
-                trace_id,
-                source,
+            return ToolResult(
+                success=False,
+                message="No registered intent matched the request.",
+                error_code="NO_MATCHING_INTENT",
             )
-            return None
-
-        logger.info(
-            "TRACE=%s INTENT_MATCH tool=%s action=%s rule=%r",
-            trace_id,
-            match.tool_name,
-            match.action,
-            match.matched_rule,
-        )
 
         return await self.dispatch_tool_call(
             match.tool_name,
-            {"action": match.action},
+            {"action": match.action, "payload": {}},
             source=source,
             trace_id=trace_id,
         )

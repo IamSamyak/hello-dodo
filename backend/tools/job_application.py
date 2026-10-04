@@ -1,5 +1,5 @@
 
-"""Job Application tool registration for Hello Dodo."""
+"""Job Application tool plugin for Hello Dodo."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ from typing import Any
 
 from service_manager import prepare_job_action
 from tools.command_bus import CommandBus, CommandTimeoutError, command_bus
+from tools.contracts import ActionSpec, ToolPlugin, ToolSpec
 from tools.intent_router import IntentRouter, intent_router
-from tools.models import ToolResult
+from tools.models import ToolContext, ToolResult
 from tools.registry import ToolRegistry, tool_registry
 
 
@@ -27,6 +28,49 @@ ACTION_MESSAGES = {
     ),
     "JOB_APPLICATION_DASHBOARD": "Job Application Dashboard khol diya.",
 }
+
+
+def _action_specs() -> tuple[ActionSpec, ...]:
+    """Return the public action contracts for the job application tool."""
+
+    return (
+        ActionSpec(
+            name="NAUKRI_OPEN_JOBS",
+            description="Open recommended Naukri jobs.",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": True,
+            },
+        ),
+        ActionSpec(
+            name="LINKEDIN_GET_JOBS",
+            description="Fetch LinkedIn jobs through the browser extension.",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": True,
+            },
+        ),
+        ActionSpec(
+            name="LINKEDIN_APPLY_EASY_APPLY",
+            description="Run LinkedIn Easy Apply automation.",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": True,
+            },
+        ),
+        ActionSpec(
+            name="JOB_APPLICATION_DASHBOARD",
+            description="Open the Job Application Dashboard.",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": True,
+            },
+        ),
+    )
 
 
 async def execute_job_application(
@@ -59,7 +103,6 @@ async def execute_job_application(
             error_code="UNSUPPORTED_ACTION",
         )
 
-    # Prepare the required local services.
     try:
         logger.info(
             "TRACE=%s SERVICE_PREPARE_START action=%s",
@@ -92,8 +135,6 @@ async def execute_job_application(
             error_code="SERVICE_START_FAILED",
         )
 
-    # Opening the dashboard is a local Windows action.
-    # Do not wait for an extension acknowledgement for this action.
     if action == "JOB_APPLICATION_DASHBOARD":
         logger.info(
             "TRACE=%s DASHBOARD_OPEN_REQUESTED url=%s elapsed=%.2fs",
@@ -110,7 +151,6 @@ async def execute_job_application(
             },
         )
 
-    # Other job actions still use the existing extension command bus.
     payload["trace_id"] = trace_id
 
     try:
@@ -182,34 +222,55 @@ async def execute_job_application(
     )
 
 
+class JobApplicationPlugin(ToolPlugin):
+    """Contract-based adapter for existing job application actions."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name=TOOL_NAME,
+            description=(
+                "Open Naukri jobs, fetch LinkedIn jobs, run LinkedIn "
+                "Easy Apply, or open the Job Application Dashboard."
+            ),
+            version="1.0.0",
+            actions=_action_specs(),
+            aliases=("jobs", "job-applications"),
+        )
+
+    async def execute(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        context: ToolContext,
+    ) -> ToolResult:
+        """Delegate execution to the existing implementation."""
+
+        execution_payload = dict(payload)
+        execution_payload["trace_id"] = context.trace_id
+
+        return await execute_job_application(
+            action,
+            payload=execution_payload,
+        )
+
+
+TOOL_PLUGIN = JobApplicationPlugin()
+
+
 def register_job_application_tool(
     *,
     registry: ToolRegistry = tool_registry,
     router: IntentRouter = intent_router,
     bus: CommandBus = command_bus,
 ) -> None:
-    """Register job actions and their voice-intent rules."""
+    """Register job application voice-intent rules.
 
-    async def handler(
-        action: str,
-        payload: dict[str, Any] | None = None,
-    ) -> ToolResult:
-        return await execute_job_application(
-            action,
-            payload=payload,
-            bus=bus,
-        )
+    Tool registration itself is owned by the plugin loader.
+    The parameters are retained for compatibility with existing callers.
+    """
 
-    if registry.get(TOOL_NAME) is None:
-        registry.register(
-            name=TOOL_NAME,
-            description=(
-                "Open Naukri jobs, fetch LinkedIn jobs, run LinkedIn "
-                "Easy Apply, or open the Job Application Dashboard."
-            ),
-            handler=handler,
-            aliases=("jobs", "job-applications"),
-        )
+    del registry, bus
 
     rules = (
         (
@@ -297,4 +358,4 @@ def register_job_application_tool(
         )
 
 
-register_job_application_tool()
+TOOL_PLUGIN = JobApplicationPlugin()

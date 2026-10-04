@@ -1,6 +1,4 @@
 
-"""Shared contracts for Hello Dodo tools."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -9,15 +7,16 @@ from typing import Any
 
 @dataclass(frozen=True, slots=True)
 class ToolContext:
-    """Metadata supplied to a tool during execution."""
+    """Execution context supplied to a tool handler."""
 
     request_id: str
     source: str = "voice"
+    trace_id: str = "-"
 
 
 @dataclass(frozen=True, slots=True)
 class ToolResult:
-    """Standardized result returned by every tool."""
+    """Standard result returned by every tool execution."""
 
     success: bool
     message: str
@@ -25,7 +24,6 @@ class ToolResult:
     error_code: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert the result to a JSON-compatible dictionary."""
         return {
             "success": self.success,
             "message": self.message,
@@ -36,10 +34,17 @@ class ToolResult:
 
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
-    """Metadata and handler for a registered tool."""
+    """
+    Backward-compatible registered tool definition.
+
+    Legacy handlers continue to use handler.
+    Contract-based plugins additionally provide spec and plugin.
+    """
 
     name: str
     description: str
     handler: Any
     enabled: bool = True
     aliases: tuple[str, ...] = ()
+    spec: Any | None = None
+    plugin: Any | None = None

@@ -1,121 +1,254 @@
 
-"""Central registry for Hello Dodo tool definitions."""
-
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from dataclasses import replace
+from threading import RLock
+from typing import Any
 
 from tools.models import ToolDefinition
 
 
 class ToolRegistry:
-    """Register and retrieve tools without editing the API layer."""
+    """Thread-safe registry for legacy tools and contract plugins."""
 
     def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {}
         self._aliases: dict[str, str] = {}
+        self._lock = RLock()
 
     @staticmethod
-    def _normalize(value: str) -> str:
-        """Normalize a tool name or alias."""
-        value = value.casefold().strip()
-        value = re.sub(r"[\s-]+", "_", value)
-        return value
+    def normalize_name(name: str) -> str:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Tool name must be a non-empty string.")
+
+        normalized = re.sub(
+            r"[\s-]+",
+            "_",
+            name.strip().casefold(),
+        )
+
+        return normalized
+
+    def _rebuild_aliases(self) -> None:
+        aliases: dict[str, str] = {}
+
+        for canonical_name, definition in self._tools.items():
+            for alias in (canonical_name, *definition.aliases):
+                normalized_alias = self.normalize_name(alias)
+
+                existing = aliases.get(normalized_alias)
+
+                if (
+                    existing is not None
+                    and existing != canonical_name
+                ):
+                    raise ValueError(
+                        f"Tool alias {alias!r} conflicts with "
+                        f"registered tool {existing!r}."
+                    )
+
+                aliases[normalized_alias] = canonical_name
+
+        self._aliases = aliases
 
     def register(
         self,
+        definition: ToolDefinition,
         *,
-        name: str,
-        description: str,
-        handler: Callable,
-        aliases: tuple[str, ...] = (),
-        enabled: bool = True,
-    ) -> ToolDefinition:
-        """Register a tool and its optional aliases."""
-        normalized_name = self._normalize(name)
+        replace_existing: bool = False,
+    ) -> None:
+        if not isinstance(definition, ToolDefinition):
+            raise TypeError(
+                "register() requires a ToolDefinition."
+            )
 
-        if not normalized_name:
-            raise ValueError("Tool name cannot be empty.")
+        name = self.normalize_name(definition.name)
 
-        if not callable(handler):
-            raise TypeError("Tool handler must be callable.")
-
-        if normalized_name in self._tools:
+        if not callable(definition.handler):
             raise ValueError(
-                f"Tool is already registered: {normalized_name}"
+                f"Tool {name!r} must have a callable handler."
             )
 
-        normalized_aliases = tuple(
-            dict.fromkeys(
-                self._normalize(alias)
-                for alias in aliases
-                if alias.strip()
-            )
+        normalized_definition = replace(
+            definition,
+            name=name,
+            aliases=tuple(
+                self.normalize_name(alias)
+                for alias in definition.aliases
+            ),
         )
 
-        for alias in normalized_aliases:
-            if alias == normalized_name:
+        with self._lock:
+            previous = self._tools.get(name)
+
+            if previous is not None and not replace_existing:
+                # Idempotent registration is allowed only for the same
+                # underlying handler/plugin, not a silent replacement.
+                if (
+                    previous.handler is definition.handler
+                    and previous.plugin is definition.plugin
+                ):
+                    return
+
                 raise ValueError(
-                    f"Alias duplicates the tool name: {alias}"
+                    f"Tool {name!r} is already registered."
                 )
 
-            if alias in self._aliases or alias in self._tools:
-                raise ValueError(
-                    f"Tool name or alias is already registered: {alias}"
-                )
+            old_tools = self._tools.copy()
+            self._tools[name] = normalized_definition
+
+            try:
+                self._rebuild_aliases()
+            except Exception:
+                self._tools = old_tools
+                self._rebuild_aliases()
+                raise
+
+    def register_plugin(
+        self,
+        plugin: Any,
+        *,
+        replace_existing: bool = False,
+    ) -> None:
+        """Register an implementation of the ToolPlugin contract."""
+        from tools.contracts import ToolPlugin
+
+        if not isinstance(plugin, ToolPlugin):
+            raise TypeError(
+                "register_plugin() requires a ToolPlugin implementation."
+            )
+
+        spec = plugin.spec
+
+        if not spec.name or not spec.name.strip():
+            raise ValueError("Plugin tool name cannot be empty.")
 
         definition = ToolDefinition(
-            name=normalized_name,
-            description=description.strip(),
-            handler=handler,
-            enabled=enabled,
-            aliases=normalized_aliases,
+            name=spec.name,
+            description=spec.description,
+            handler=plugin.execute,
+            enabled=True,
+            aliases=tuple(spec.aliases),
+            spec=spec,
+            plugin=plugin,
         )
 
-        self._tools[normalized_name] = definition
-
-        for alias in normalized_aliases:
-            self._aliases[alias] = normalized_name
-
-        return definition
+        self.register(
+            definition,
+            replace_existing=replace_existing,
+        )
 
     def get(self, name: str) -> ToolDefinition | None:
-        """Find a tool by its registered name or alias."""
-        normalized = self._normalize(name)
-        canonical_name = self._aliases.get(normalized, normalized)
-        return self._tools.get(canonical_name)
+        """Resolve a canonical name or registered alias."""
+        normalized = self.normalize_name(name)
+
+        with self._lock:
+            canonical_name = self._aliases.get(normalized)
+
+            if canonical_name is None:
+                return None
+
+            return self._tools.get(canonical_name)
+
+    def get_plugin(self, name: str) -> Any | None:
+        definition = self.get(name)
+
+        if definition is None:
+            return None
+
+        return definition.plugin
 
     def list_tools(
         self,
-        *,
         enabled_only: bool = True,
-    ) -> tuple[ToolDefinition, ...]:
-        """Return registered tools in registration order."""
-        tools = self._tools.values()
+    ) -> list[ToolDefinition]:
+        with self._lock:
+            definitions = list(self._tools.values())
 
         if enabled_only:
-            tools = (
-                tool for tool in tools if tool.enabled
+            definitions = [
+                definition
+                for definition in definitions
+                if definition.enabled
+            ]
+
+        return sorted(
+            definitions,
+            key=lambda definition: definition.name,
+        )
+
+    def list_catalog(
+        self,
+        enabled_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Return JSON-compatible tool metadata for decision prompts."""
+        catalog: list[dict[str, Any]] = []
+
+        for definition in self.list_tools(enabled_only=enabled_only):
+            item: dict[str, Any] = {
+                "name": definition.name,
+                "description": definition.description,
+                "aliases": list(definition.aliases),
+                "contract_version": None,
+                "actions": [],
+            }
+
+            if definition.spec is not None:
+                item["contract_version"] = definition.spec.version
+
+                item["actions"] = [
+                    {
+                        "name": action.name,
+                        "description": action.description,
+                        "input_schema": action.input_schema,
+                    }
+                    for action in definition.spec.actions
+                ]
+
+            catalog.append(item)
+
+        return catalog
+
+    def set_enabled(
+        self,
+        name: str,
+        enabled: bool,
+    ) -> bool:
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a boolean.")
+
+        normalized = self.normalize_name(name)
+
+        with self._lock:
+            canonical_name = self._aliases.get(normalized)
+
+            if canonical_name is None:
+                return False
+
+            definition = self._tools[canonical_name]
+
+            self._tools[canonical_name] = replace(
+                definition,
+                enabled=enabled,
             )
 
-        return tuple(tools)
+            return True
 
-    def set_enabled(self, name: str, enabled: bool) -> bool:
-        """Enable or disable a registered tool."""
-        tool = self.get(name)
+    def unregister(self, name: str) -> bool:
+        """Remove a tool and its aliases."""
+        normalized = self.normalize_name(name)
 
-        if tool is None:
-            return False
+        with self._lock:
+            canonical_name = self._aliases.get(normalized)
 
-        self._tools[tool.name] = ToolDefinition(
-            name=tool.name,
-            description=tool.description,
-            handler=tool.handler,
-            enabled=enabled,
-            aliases=tool.aliases,
-        )
-        return True
+            if canonical_name is None:
+                return False
+
+            del self._tools[canonical_name]
+            self._rebuild_aliases()
+
+            return True
 
 
 tool_registry = ToolRegistry()

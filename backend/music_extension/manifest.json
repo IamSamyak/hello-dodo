@@ -1,0 +1,28 @@
+
+{
+  "manifest_version": 3,
+  "name": "Hello Dodo Music Controller",
+  "version": "1.0.0",
+  "description": "Controls YouTube Music through Hello Dodo.",
+  "permissions": [
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*",
+    "https://music.youtube.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://music.youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
